@@ -155,6 +155,147 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
+  describe('Gonka custom endpoint safety', () => {
+    const model = 'deepseek-ai/DeepSeek-V4-Flash-0731';
+    const gonka = () => new OpenAICompatProvider({
+      platform: 'custom',
+      name: 'Custom',
+      baseUrl: 'https://api.gonkarouter.io/v1',
+    });
+
+    beforeEach(() => {
+      // Keep custom-endpoint SSRF validation offline.
+      vi.spyOn(dns.promises, 'lookup').mockResolvedValue([{ address: '203.0.113.10', family: 4 }] as any);
+    });
+
+    it('sends the required User-Agent and disables Gonka fallback', async () => {
+      let headers = new Headers();
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        headers = new Headers((init as any).headers);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'gonka-test',
+            object: 'chat.completion',
+            created: 123,
+            model,
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        } as any;
+      });
+
+      await gonka().chatCompletion('test-key', [{ role: 'user', content: 'hi' }], model);
+
+      expect(headers.get('User-Agent')).toBe('Mozilla/5.0 FreeLLMAPI/1.0');
+      expect(headers.get('X-Gonka-No-Fallback')).toBe('true');
+    });
+
+    it('does not apply Gonka-only headers to a look-alike custom host', async () => {
+      let headers = new Headers();
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        headers = new Headers((init as any).headers);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'other-test',
+            object: 'chat.completion',
+            created: 123,
+            model,
+            choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+        } as any;
+      });
+
+      const other = new OpenAICompatProvider({
+        platform: 'custom',
+        name: 'Custom',
+        baseUrl: 'https://api.gonkarouter.io.example.com/v1',
+      });
+      await other.chatCompletion('test-key', [{ role: 'user', content: 'hi' }], model);
+
+      expect(headers.get('User-Agent')).not.toBe('Mozilla/5.0 FreeLLMAPI/1.0');
+      expect(headers.get('X-Gonka-No-Fallback')).toBeNull();
+    });
+
+    it('fails closed when a non-streaming response reports a different model', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'gonka-mismatch',
+          object: 'chat.completion',
+          created: 123,
+          model: 'different-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'wrong backend' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any);
+
+      await expect(
+        gonka().chatCompletion('test-key', [{ role: 'user', content: 'hi' }], model),
+      ).rejects.toMatchObject({
+        status: 502,
+        message: 'GonkaRouter returned a different or missing model identity',
+      });
+    });
+
+    it('fails closed when a non-streaming response omits the model identity', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'gonka-missing-model',
+          object: 'chat.completion',
+          created: 123,
+          choices: [{ index: 0, message: { role: 'assistant', content: 'unverifiable backend' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }),
+      } as any);
+
+      await expect(
+        gonka().chatCompletion('test-key', [{ role: 'user', content: 'hi' }], model),
+      ).rejects.toMatchObject({
+        status: 502,
+        message: 'GonkaRouter returned a different or missing model identity',
+      });
+    });
+    it('checks model identity before yielding a streaming chunk', async () => {
+      let headers = new Headers();
+      vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+        headers = new Headers((init as any).headers);
+        return sseResponse([
+          'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"different-model","choices":[{"index":0,"delta":{"content":"wrong backend"},"finish_reason":null}]}\n\n',
+          'data: [DONE]\n\n',
+        ]);
+      });
+
+      await expect(
+        collect(gonka().streamChatCompletion('test-key', [{ role: 'user', content: 'hi' }], model)),
+      ).rejects.toMatchObject({
+        status: 502,
+        message: 'GonkaRouter returned a different or missing model identity',
+      });
+
+      expect(headers.get('User-Agent')).toBe('Mozilla/5.0 FreeLLMAPI/1.0');
+      expect(headers.get('X-Gonka-No-Fallback')).toBe('true');
+    });
+    it('fails closed before yielding a streaming chunk with no model identity', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce(
+        sseResponse([
+          'data: {"id":"x","object":"chat.completion.chunk","created":1,"choices":[{"index":0,"delta":{"content":"unverifiable backend"},"finish_reason":null}]}\n\n',
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      await expect(
+        collect(gonka().streamChatCompletion('test-key', [{ role: 'user', content: 'hi' }], model)),
+      ).rejects.toMatchObject({
+        status: 502,
+        message: 'GonkaRouter returned a different or missing model identity',
+      });
+    });
+  });
+
   it('uses a 60s chat timeout by default for OpenAI-compatible providers (#530)', async () => {
     const delays: number[] = [];
     const origSetTimeout = global.setTimeout;
@@ -286,6 +427,76 @@ describe('OpenAICompatProvider', () => {
       vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
       await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm', { tools, parallel_tool_calls: true });
       expect(body.parallel_tool_calls).toBe(true);
+    });
+
+    it('disables Nemotron 3.5 Lightning thinking for reasoning_effort none', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+        body = JSON.parse((init as any).body);
+        return okResponse;
+      });
+
+      await nim().chatCompletion(
+        'k',
+        [{ role: 'user', content: 'hi' }],
+        'nvidia/nemotron-3.5-lightning-30b-a3b',
+        { reasoning_effort: 'none' },
+      );
+
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+      expect(body).not.toHaveProperty('reasoning_effort');
+    });
+
+    it('disables Nemotron 3.5 Lightning thinking for minimal effort on streams', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+        body = JSON.parse((init as any).body);
+        return sseResponse([
+          'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\n',
+          'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          'data: [DONE]\n\n',
+        ]);
+      });
+
+      await collect(nim().streamChatCompletion(
+        'k',
+        [{ role: 'user', content: 'hi' }],
+        'nvidia/nemotron-3.5-lightning-30b-a3b',
+        { reasoning_effort: 'minimal' },
+      ));
+
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+      expect(body).not.toHaveProperty('reasoning_effort');
+    });
+
+    it('keeps generic reasoning_effort behavior for other NVIDIA models', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+
+      await nim().chatCompletion(
+        'k',
+        [{ role: 'user', content: 'hi' }],
+        'nvidia/nemotron-3-super-120b-a12b',
+        { reasoning_effort: 'none' },
+      );
+
+      expect(body.reasoning_effort).toBe('none');
+      expect(body).not.toHaveProperty('chat_template_kwargs');
+    });
+
+    it('keeps non-off reasoning_effort behavior for Nemotron 3.5 Lightning', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+
+      await nim().chatCompletion(
+        'k',
+        [{ role: 'user', content: 'hi' }],
+        'nvidia/nemotron-3.5-lightning-30b-a3b',
+        { reasoning_effort: 'low' },
+      );
+
+      expect(body.reasoning_effort).toBe('low');
+      expect(body).not.toHaveProperty('chat_template_kwargs');
     });
   });
 
@@ -817,6 +1028,56 @@ describe('OpenAICompatProvider - platform instances', () => {
       } finally {
         delete process.env.VALIDATE_TOOL_ARGUMENTS;
       }
+    });
+
+    it('Gonka non-stream does not rescue failed_generation without verifiable model identity', async () => {
+      vi.spyOn(dns.promises, 'lookup').mockResolvedValue([{ address: '203.0.113.10', family: 4 }] as any);
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve(failBody),
+      } as any);
+
+      const gonka = new OpenAICompatProvider({
+        platform: 'custom',
+        name: 'Custom',
+        baseUrl: 'https://api.gonkarouter.io/v1',
+      });
+
+      await expect(
+        gonka.chatCompletion(
+          'key',
+          [{ role: 'user', content: 'read sample.txt' }],
+          'deepseek-ai/DeepSeek-V4-Flash-0731',
+          { tools, tool_choice: 'auto' },
+        ),
+      ).rejects.toThrow(/API error 400/);
+    });
+
+    it('Gonka stream does not rescue failed_generation without verifiable model identity', async () => {
+      vi.spyOn(dns.promises, 'lookup').mockResolvedValue([{ address: '203.0.113.10', family: 4 }] as any);
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+        ok: false, status: 400, statusText: 'Bad Request',
+        json: () => Promise.resolve(failBody),
+      } as any);
+
+      const gonka = new OpenAICompatProvider({
+        platform: 'custom',
+        name: 'Custom',
+        baseUrl: 'https://api.gonkarouter.io/v1',
+      });
+
+      const consume = async () => {
+        for await (const _chunk of gonka.streamChatCompletion(
+          'key',
+          [{ role: 'user', content: 'read sample.txt' }],
+          'deepseek-ai/DeepSeek-V4-Flash-0731',
+          { tools, tool_choice: 'auto' },
+        )) {
+          // Gonka must throw before synthesizing or yielding a rescued turn.
+        }
+      };
+
+      await expect(consume()).rejects.toThrow(/API error 400/);
     });
 
     it('still throws when there is no failed_generation to rescue', async () => {

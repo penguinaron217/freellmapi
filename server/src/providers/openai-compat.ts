@@ -19,6 +19,7 @@ import { contentToString } from '../lib/content.js';
 /** Hosts that ARE Moonshot's OpenAI-compatible API (api.moonshot.ai,
  * api.moonshot.cn, api.kimi.com and their subdomains). */
 const MOONSHOT_HOST_SUFFIXES = ['moonshot.ai', 'moonshot.cn', 'kimi.com'];
+const GONKA_API_HOST = 'api.gonkarouter.io';
 
 /**
  * Whether a base URL points at Moonshot's own API. Moonshot documents an
@@ -36,6 +37,15 @@ export function isMoonshotEndpoint(baseUrl: string): boolean {
     return false;
   }
   return MOONSHOT_HOST_SUFFIXES.some((d) => host === d || host.endsWith(`.${d}`));
+}
+
+/** Whether a custom base URL points at GonkaRouter's OpenAI-compatible API. */
+export function isGonkaEndpoint(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase() === GONKA_API_HOST;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -81,6 +91,9 @@ export class OpenAICompatProvider extends BaseProvider {
   /** True only for a custom endpoint whose host is Moonshot's own API; see
    * isMoonshotEndpoint(). Gates the assistant `partial` prefill flag (#1038). */
   private readonly forwardsPartial: boolean;
+  /** Gonka's Cloudflare edge requires a product UA, and named requests must
+   * explicitly disable Gonka's own model fallback. */
+  private readonly gonkaEndpoint: boolean;
 
   constructor(opts: {
     platform: Platform;
@@ -96,13 +109,33 @@ export class OpenAICompatProvider extends BaseProvider {
     this.platform = opts.platform;
     this.name = opts.name;
     this.baseUrl = opts.baseUrl;
-    this.extraHeaders = opts.extraHeaders ?? {};
+    this.gonkaEndpoint = opts.platform === 'custom' && isGonkaEndpoint(opts.baseUrl);
+    this.extraHeaders = {
+      ...(opts.extraHeaders ?? {}),
+      ...(this.gonkaEndpoint ? { 'User-Agent': 'Mozilla/5.0 FreeLLMAPI/1.0' } : {}),
+    };
     this.validateUrl = opts.validateUrl;
     // PROVIDER_TIMEOUT_<PLATFORM> wins over the registration default (#547).
     this.timeoutMs = providerTimeoutMs(opts.platform, opts.timeoutMs ?? 60_000);
     this.keyless = opts.keyless ?? false;
     this.forceSingleToolCall = opts.forceSingleToolCall ?? false;
     this.forwardsPartial = opts.platform === 'custom' && isMoonshotEndpoint(opts.baseUrl);
+  }
+
+  private assertGonkaModelIdentity(requested: string, returned: string): void {
+    if (this.gonkaEndpoint && (!returned || returned !== requested)) {
+      throw Object.assign(new Error('GonkaRouter returned a different or missing model identity'), { status: 502 });
+    }
+  }
+
+  private async *guardGonkaStreamIdentity(
+    src: AsyncGenerator<ChatCompletionChunk>,
+    requested: string,
+  ): AsyncGenerator<ChatCompletionChunk> {
+    for await (const chunk of src) {
+      this.assertGonkaModelIdentity(requested, chunk.model);
+      yield chunk;
+    }
   }
 
   /** Resolve the parallel_tool_calls flag to send upstream. For providers that
@@ -112,6 +145,20 @@ export class OpenAICompatProvider extends BaseProvider {
   private resolveParallelToolCalls(options?: CompletionOptions): boolean | undefined {
     if (this.forceSingleToolCall && options?.tools && options.tools.length > 0) return false;
     return options?.parallel_tool_calls;
+  }
+
+  /** Nemotron 3.5 Lightning uses NVIDIA NIM's chat-template switch to disable
+   * reasoning. Translate FreeLLMAPI's two "off" effort values only for that
+   * exact model; every other NVIDIA model keeps the existing wire behavior. */
+  private nvidiaThinkingParams(modelId: string, options?: CompletionOptions): Record<string, unknown> {
+    if (
+      this.platform !== 'nvidia'
+      || modelId !== 'nvidia/nemotron-3.5-lightning-30b-a3b'
+      || (options?.reasoning_effort !== 'none' && options?.reasoning_effort !== 'minimal')
+    ) {
+      return {};
+    }
+    return { reasoning_effort: undefined, chat_template_kwargs: { enable_thinking: false } };
   }
 
   /** Some providers (Groq especially) reject a model's tool call with a 400
@@ -279,6 +326,7 @@ export class OpenAICompatProvider extends BaseProvider {
         ...this.authHeader(apiKey),
         'Content-Type': 'application/json',
         ...this.extraHeaders,
+        ...(this.gonkaEndpoint ? { 'X-Gonka-No-Fallback': 'true' } : {}),
       },
       body: JSON.stringify({
         model: modelId,
@@ -291,6 +339,7 @@ export class OpenAICompatProvider extends BaseProvider {
         tool_choice: options?.tool_choice,
         parallel_tool_calls: this.resolveParallelToolCalls(options),
         ...extendedBodyParams(this.platform, options),
+        ...this.nvidiaThinkingParams(modelId, options),
       }),
       // 'request' bounds: the deadline covers the body read too, so a 200
       // whose body hangs aborts instead of stalling res.json() forever.
@@ -307,7 +356,7 @@ export class OpenAICompatProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      const rescued = this.rescueFailedGeneration(err, options);
+      const rescued = this.gonkaEndpoint ? null : this.rescueFailedGeneration(err, options);
       if (rescued) {
         console.log(`[${this.name}] Rescued ${rescued.length} inline tool call(s) from a ${res.status} tool_use_failed (#264)`);
         const out: ChatCompletionResponse = {
@@ -380,6 +429,7 @@ export class OpenAICompatProvider extends BaseProvider {
       );
     }
     normalizeChoices(data);
+    this.assertGonkaModelIdentity(modelId, data.model);
     // #pollinations-inband: a 200 whose body is really an out-of-credits notice
     // must fail over, not be returned as the answer. The "402 ... insufficient
     // credit" wording makes isPaymentRequiredError classify it as retryable and
@@ -408,6 +458,7 @@ export class OpenAICompatProvider extends BaseProvider {
         ...this.authHeader(apiKey),
         'Content-Type': 'application/json',
         ...this.extraHeaders,
+        ...(this.gonkaEndpoint ? { 'X-Gonka-No-Fallback': 'true' } : {}),
       },
       body: JSON.stringify({
         model: modelId,
@@ -420,6 +471,7 @@ export class OpenAICompatProvider extends BaseProvider {
         tool_choice: options?.tool_choice,
         parallel_tool_calls: this.resolveParallelToolCalls(options),
         ...extendedBodyParams(this.platform, options),
+        ...this.nvidiaThinkingParams(modelId, options),
         stream: true,
         stream_options: options?.stream_options,
       }),
@@ -438,7 +490,7 @@ export class OpenAICompatProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      const rescued = this.rescueFailedGeneration(err, options);
+      const rescued = this.gonkaEndpoint ? null : this.rescueFailedGeneration(err, options);
       if (rescued) {
         console.log(`[${this.name}] Rescued ${rescued.length} inline tool call(s) from a ${res.status} tool_use_failed (stream, #264)`);
         const base = { id: `chatcmpl-rescued-${Date.now()}`, object: 'chat.completion.chunk' as const, created: Math.floor(Date.now() / 1000), model: modelId };
@@ -453,8 +505,11 @@ export class OpenAICompatProvider extends BaseProvider {
     // First-byte grace (#584): the same chat timeout that bounded the headers
     // also budgets the first stream read — NIM-style providers send SSE
     // headers instantly, then prefill long prompts for minutes.
-    yield* this.guardInBandCreditsError(
-      this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs }),
+    yield* this.guardGonkaStreamIdentity(
+      this.guardInBandCreditsError(
+        this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs }),
+      ),
+      modelId,
     );
   }
 
